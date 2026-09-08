@@ -38,7 +38,7 @@ tray-icon = "0.24"
 
 # --- Logging ra file để debug khi app chạy ẩn, không có console ---
 log = "0.4"
-simple_logging = "2.0"
+simple-logging = "2.0"
 
 # --- Định nghĩa lỗi tường minh, có ngữ cảnh, thay vì unwrap()/String thô ---
 thiserror = "2.0"
