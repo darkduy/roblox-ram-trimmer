@@ -1,0 +1,44 @@
+[package]
+name = "roblox-ram-trimmer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+description = "Tự động trim RAM tiến trình Roblox khi RAM hệ thống vượt ngưỡng, chạy nền qua system tray."
+authors = ["Duyvietnambeta"]
+
+[[bin]]
+name = "roblox-ram-trimmer"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3       # Tối ưu tốc độ tối đa — app chạy nền liên tục, cần nhẹ CPU.
+lto = true          # Link-time optimization: giảm kích thước binary, tăng hiệu năng.
+codegen-units = 1   # Đánh đổi thời gian build lấy chất lượng tối ưu hóa tốt hơn.
+panic = "abort"     # App nền không cần unwind phức tạp; abort giúp binary nhỏ hơn.
+strip = true        # Loại bỏ debug symbols khỏi binary release.
+
+[dependencies]
+# --- WinAPI bindings chính thức của Microsoft ---
+# Dùng để: đọc RAM hệ thống (GlobalMemoryStatusEx), liệt kê tiến trình
+# (CreateToolhelp32Snapshot), đọc bộ nhớ tiến trình (GetProcessMemoryInfo),
+# và trim working set (SetProcessWorkingSetSize).
+windows = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+
+# --- System tray icon (Windows-native qua Shell_NotifyIcon). Message loop
+# Win32 dùng thẳng crate `windows` ở trên, không cần thêm windows-sys riêng. ---
+tray-icon = "0.24"
+
+# --- Logging ra file để debug khi app chạy ẩn, không có console ---
+log = "0.4"
+simple_logging = "2.0"
+
+# --- Định nghĩa lỗi tường minh, có ngữ cảnh, thay vì unwrap()/String thô ---
+thiserror = "2.0"

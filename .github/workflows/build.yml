@@ -1,0 +1,73 @@
+name: Build Windows Release
+
+# Kích hoạt khi:
+# - Push tag dạng v* (ví dụ v0.1.0) -> build và đính kèm vào GitHub Release
+# - Push lên nhánh main -> build để kiểm tra compile OK (không tạo release)
+# - Bấm "Run workflow" thủ công trên tab Actions của GitHub
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+env:
+  BINARY_NAME: roblox-ram-trimmer
+
+jobs:
+  build:
+    # Bắt buộc chạy trên Windows vì code dùng WinAPI (windows crate) và
+    # không thể cross-compile đầy đủ từ Linux runner cho các API này.
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cài đặt Rust toolchain 1.98.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+          targets: x86_64-pc-windows-msvc
+
+      # Cache thư mục cargo registry + target để các lần build sau nhanh
+      # hơn đáng kể (không phải tải lại toàn bộ dependency mỗi lần).
+      - name: Cache cargo registry & build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Xác định đường dẫn binary vừa build
+        id: artifact
+        shell: bash
+        run: |
+          echo "path=target/x86_64-pc-windows-msvc/release/${{ env.BINARY_NAME }}.exe" >> "$GITHUB_OUTPUT"
+
+      # Luôn upload artifact cho mọi lần chạy (push main, workflow_dispatch,
+      # hoặc tag) để có thể tải binary về kiểm tra ngay từ tab Actions,
+      # kể cả khi không phải là một bản release chính thức.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-windows-x64
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+
+      # Chỉ tạo GitHub Release (kèm file .exe đính kèm) khi push tag dạng
+      # v* — ví dụ: git tag v0.1.0 && git push origin v0.1.0
+      - name: Tạo GitHub Release (chỉ khi push tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.artifact.outputs.path }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
