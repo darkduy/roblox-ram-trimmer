@@ -8,7 +8,9 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 pub struct SystemMemoryStatus {
     /// % RAM vật lý đang được sử dụng (0-100), do Windows tự tính.
     pub memory_load_percent: u32,
+    /// Tổng RAM vật lý của máy, tính bằng byte.
     pub total_physical_bytes: u64,
+    /// RAM vật lý còn khả dụng tại thời điểm truy vấn, tính bằng byte.
     pub available_physical_bytes: u64,
 }
 

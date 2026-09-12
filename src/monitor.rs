@@ -54,6 +54,16 @@ pub fn run_monitor_loop(state: AppStateHandle) -> ! {
         let ram_percent = ram_status.memory_load_percent as f32;
         state.set_ram_percent(ram_percent);
 
+        // Log chi tiết dung lượng RAM (không chỉ %) mỗi lần kiểm tra —
+        // hữu ích khi tra cứu log để hiểu bối cảnh cụ thể (bao nhiêu GB
+        // khả dụng/tổng) tại thời điểm một đợt trim đã xảy ra hoặc chưa.
+        log::info!(
+            "RAM hệ thống: {:.1}% ({:.1} GB khả dụng / {:.1} GB tổng)",
+            ram_percent,
+            ram_status.available_physical_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+            ram_status.total_physical_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+        );
+
         phase = match phase {
             MonitorPhase::CoolingDown { since } => {
                 let elapsed = since.elapsed();

@@ -58,6 +58,12 @@ pub struct SharedAppState {
 #[derive(Debug, Clone)]
 pub struct AppStateHandle(Arc<Mutex<SharedAppState>>);
 
+impl Default for AppStateHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppStateHandle {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(SharedAppState::default())))
