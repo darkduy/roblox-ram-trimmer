@@ -5,7 +5,7 @@
 //! vòng lặp tối giản thay vì kéo thêm dependency winit/tao chỉ để phục
 //! vụ mục đích này — giữ binary nhẹ và ít phụ thuộc.
 
-use crate::app_state::{AppStateHandle, AppStatus};
+use crate::app_state::{AppStateHandle, AppStatus, LastTrimInfo};
 use crate::config::RAM_THRESHOLD_PERCENT;
 use std::time::Duration;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -59,9 +59,8 @@ fn format_ram_line(percent: Option<f32>) -> String {
 }
 
 /// Định dạng dòng hiển thị lần trim gần nhất cho menu item.
-fn format_last_trim_line(state: &AppStateHandle) -> String {
-    let snapshot = state.snapshot();
-    match snapshot.last_trim {
+fn format_last_trim_line(last_trim: Option<&LastTrimInfo>) -> String {
+    match last_trim {
         Some(info) => {
             let secs_ago = info.finished_at.elapsed().as_secs();
             format!(
@@ -87,7 +86,7 @@ pub fn run_tray_ui(state: AppStateHandle) -> ! {
     // có thể click — đây là cách làm chuẩn cho "info rows" trong tray menu.
     let status_item = MenuItem::new("Đang khởi động...", false, None);
     let ram_item = MenuItem::new(format_ram_line(None), false, None);
-    let last_trim_item = MenuItem::new(format_last_trim_line(&state), false, None);
+    let last_trim_item = MenuItem::new(format_last_trim_line(None), false, None);
     let quit_item = MenuItem::with_id(MENU_ID_QUIT, "Thoát", true, None);
 
     let menu = Menu::new();
@@ -115,6 +114,14 @@ pub fn run_tray_ui(state: AppStateHandle) -> ! {
 
     let mut msg = MSG::default();
     let mut last_ui_refresh = std::time::Instant::now();
+
+    // Chu kỳ "nhịp tim" của vòng lặp UI: vừa là khoảng chờ sự kiện menu
+    // (qua recv_timeout), vừa là tần suất bơm Win32 message queue.
+    // 300ms vẫn đủ nhanh để menu/click cảm giác mượt (con người khó nhận
+    // ra độ trễ dưới ~300ms cho một thao tác click chuột phải mở menu),
+    // nhưng giảm đáng kể số lần CPU phải thức dậy so với polling 50ms
+    // trước đây (giảm từ 20 lần/giây xuống ~3.3 lần/giây khi idle).
+    const UI_POLL_INTERVAL: Duration = Duration::from_millis(300);
     const UI_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
     loop {
@@ -126,14 +133,6 @@ pub fn run_tray_ui(state: AppStateHandle) -> ! {
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
-            }
-        }
-
-        // Xử lý sự kiện click vào menu item "Thoát".
-        if let Ok(event) = menu_event_receiver.try_recv() {
-            if event.id.0 == MENU_ID_QUIT {
-                log::info!("Người dùng chọn Thoát từ tray menu.");
-                std::process::exit(0);
             }
         }
 
@@ -149,11 +148,28 @@ pub fn run_tray_ui(state: AppStateHandle) -> ! {
             last_ui_refresh = std::time::Instant::now();
         }
 
-        std::thread::sleep(Duration::from_millis(50));
+        // Chờ sự kiện menu tối đa UI_POLL_INTERVAL — đây là điểm mấu chốt
+        // để tiết kiệm tài nguyên: thread thực sự NGỦ (0% CPU) trong lúc
+        // chờ, thay vì busy-poll bằng sleep() cố định như trước. Nếu có
+        // click ngay lập tức, hàm trả về ngay (độ trễ ~0ms) thay vì phải
+        // đợi tới vòng lặp tiếp theo.
+        match menu_event_receiver.recv_timeout(UI_POLL_INTERVAL) {
+            Ok(event) if event.id.0 == MENU_ID_QUIT => {
+                log::info!("Người dùng chọn Thoát từ tray menu.");
+                std::process::exit(0);
+            }
+            // Menu item khác (nếu sau này thêm) hoặc hết thời gian chờ —
+            // cả hai đều quay lại đầu vòng lặp bình thường.
+            Ok(_) | Err(_) => {}
+        }
     }
 }
 
 /// Đọc snapshot trạng thái mới nhất và cập nhật tooltip + các dòng menu.
+///
+/// Chỉ gọi `state.snapshot()` đúng một lần (thay vì để mỗi hàm định dạng
+/// tự lấy snapshot riêng) — tránh khóa mutex và clone dữ liệu 2 lần cho
+/// cùng một lần refresh.
 fn refresh_ui(
     state: &AppStateHandle,
     status_item: &MenuItem,
@@ -171,7 +187,7 @@ fn refresh_ui(
 
     status_item.set_text(&status_text);
     ram_item.set_text(format_ram_line(snapshot.last_ram_percent));
-    last_trim_item.set_text(format_last_trim_line(state));
+    last_trim_item.set_text(format_last_trim_line(snapshot.last_trim.as_ref()));
 
     let tooltip = format!("Roblox RAM Trimmer\n{status_text}");
     let _ = tray_icon.set_tooltip(Some(tooltip));

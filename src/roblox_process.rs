@@ -10,10 +10,14 @@ use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+// SetProcessWorkingSetSizeEx thuộc module Memory (không phải Threading,
+// dù thao tác trên process handle) trong windows-rs.
+use windows::Win32::System::Memory::{SETPROCESSWORKINGSETSIZEEX_FLAGS, SetProcessWorkingSetSizeEx};
+use windows::Win32::System::ProcessStatus::{
+    EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SET_QUOTA, PROCESS_VM_READ,
-    SetProcessWorkingSetSizeEx,
 };
 
 /// Thông tin tối thiểu về một tiến trình Roblox đang chạy, đủ để định vị
@@ -33,6 +37,10 @@ pub struct TrimOutcome {
     pub bytes_trimmed: u64,
     pub steps_completed: u32,
     pub hit_floor: bool,
+    /// Bước dồn/nén cuối cùng (EmptyWorkingSet) có chạy thành công không.
+    /// Bước này không tính vào `bytes_trimmed` vì mục đích của nó là
+    /// giảm phân mảnh working set, không phải trim thêm dung lượng.
+    pub defragmented: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,36 +125,49 @@ fn enumerate_roblox_processes() -> Result<Vec<RobloxProcessInfo>, RobloxProcessE
 }
 
 /// Đọc working set (RAM vật lý thực chiếm dụng) hiện tại của một tiến
-/// trình theo PID.
+/// trình, dùng một `HANDLE` đã mở sẵn (tránh mở/đóng handle mới mỗi lần
+/// gọi — quan trọng khi hàm này được gọi lặp lại nhiều lần trong vòng
+/// lặp trim, tiết kiệm chi phí syscall không cần thiết).
+fn query_working_set_size_with_handle(
+    handle: windows::Win32::Foundation::HANDLE,
+    pid: u32,
+) -> Result<u64, RobloxProcessError> {
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+
+    // SAFETY: `handle` do caller đảm bảo hợp lệ (còn sống, đủ quyền
+    // PROCESS_QUERY_INFORMATION); `counters` đã set đúng trường `cb`.
+    unsafe {
+        GetProcessMemoryInfo(
+            handle,
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    }
+    .map_err(|source| RobloxProcessError::QueryMemoryFailed { pid, source })?;
+
+    Ok(counters.WorkingSetSize as u64)
+}
+
+/// Đọc working set (RAM vật lý thực chiếm dụng) hiện tại của một tiến
+/// trình theo PID, tự mở và đóng handle riêng — dùng cho các lần gọi
+/// đơn lẻ, không lặp lại (ví dụ khi liệt kê danh sách tiến trình).
 fn query_working_set_size(pid: u32) -> Result<u64, RobloxProcessError> {
     // SAFETY: OpenProcess với quyền tối thiểu cần thiết chỉ để đọc thông
     // tin bộ nhớ; PID đến từ snapshot hợp lệ của hệ thống.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
         .map_err(|source| RobloxProcessError::OpenProcessFailed { pid, source })?;
 
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-
-    // SAFETY: `handle` vừa mở thành công ở trên; `counters` đã set đúng
-    // trường `cb` theo yêu cầu API.
-    let result = unsafe {
-        GetProcessMemoryInfo(
-            handle,
-            &mut counters,
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        )
-    };
+    let result = query_working_set_size_with_handle(handle, pid);
 
     // SAFETY: đóng handle ngay sau khi dùng xong, tránh leak.
     unsafe {
         let _ = CloseHandle(handle);
     }
 
-    result.map_err(|source| RobloxProcessError::QueryMemoryFailed { pid, source })?;
-
-    Ok(counters.WorkingSetSize as u64)
+    result
 }
 
 /// Tìm tiến trình Roblox đang chiếm nhiều RAM nhất trong số các tiến
@@ -196,8 +217,11 @@ pub fn trim_process_gradually(
 
     let trim_result = (|| -> Result<(), RobloxProcessError> {
         while outcome.bytes_trimmed < TRIM_TOTAL_TARGET_BYTES {
-            let current_ws =
-                query_working_set_size(process.pid).unwrap_or(process.working_set_bytes);
+            // Tái dùng `handle` đã mở sẵn ở trên thay vì mở handle mới
+            // mỗi bước — giảm số syscall OpenProcess/CloseHandle từ 2 lần
+            // xuống 0 lần mỗi bước trim (tiết kiệm đáng kể qua 16 bước).
+            let current_ws = query_working_set_size_with_handle(handle, process.pid)
+                .unwrap_or(process.working_set_bytes);
 
             let remaining_target = TRIM_TOTAL_TARGET_BYTES - outcome.bytes_trimmed;
             let step = TRIM_STEP_BYTES.min(remaining_target);
@@ -218,10 +242,17 @@ pub fn trim_process_gradually(
             }
 
             // SAFETY: `handle` hợp lệ, mở với PROCESS_SET_QUOTA ở trên.
-            // Dùng biến thể `Ex` với flag 0 (hành vi tương đương API cũ
-            // SetProcessWorkingSetSize) để tương thích rộng nhất.
+            // flags=0 (tương đương SetProcessWorkingSetSize cũ): không
+            // ép cứng giới hạn min/max, để Windows tự quản lý linh hoạt
+            // sau khi trim — tránh khóa cứng working set có thể gây hại
+            // nếu Roblox thực sự cần nhiều RAM hơn ngay sau đó.
             unsafe {
-                SetProcessWorkingSetSizeEx(handle, new_target as usize, new_target as usize, 0)
+                SetProcessWorkingSetSizeEx(
+                    handle,
+                    new_target as usize,
+                    new_target as usize,
+                    SETPROCESSWORKINGSETSIZEEX_FLAGS(0),
+                )
             }
             .map_err(|source| RobloxProcessError::TrimFailed {
                 pid: process.pid,
@@ -238,6 +269,33 @@ pub fn trim_process_gradually(
         }
         Ok(())
     })();
+
+    // Bước chống phân mảnh: sau khi đã trim xong theo từng bước nhỏ
+    // (kiểm soát chính xác dung lượng theo yêu cầu), gọi EmptyWorkingSet
+    // một lần dứt khoát để Windows dồn lại các trang còn resident thành
+    // một working set gọn hơn — đây là API chuyên dụng cho việc này
+    // (chính là API mà nút "Trim Working Set" của Task Manager dùng),
+    // hiệu quả hơn việc chỉ dựa vào SetProcessWorkingSetSizeEx nhiều lần.
+    //
+    // Chỉ chạy bước này nếu vòng lặp trim ở trên không lỗi — nếu trim
+    // chính đã thất bại thì không có ý nghĩa để "dọn gọn" thêm.
+    if trim_result.is_ok() {
+        // SAFETY: `handle` vẫn còn hợp lệ tại đây (chưa bị đóng ở dưới),
+        // đã mở với đủ quyền PROCESS_QUERY_INFORMATION + PROCESS_SET_QUOTA
+        // theo đúng yêu cầu của EmptyWorkingSet.
+        outcome.defragmented = unsafe { EmptyWorkingSet(handle) }.is_ok();
+
+        if !outcome.defragmented {
+            // Không coi đây là lỗi nghiêm trọng: phần trim chính (kiểm
+            // soát được dung lượng) đã thành công, bước dồn gọn thêm chỉ
+            // là tối ưu bổ sung — thất bại ở đây không nên phá hỏng kết
+            // quả trim đã đạt được.
+            log::warn!(
+                "EmptyWorkingSet (bước chống phân mảnh) thất bại cho PID {}, bỏ qua.",
+                process.pid
+            );
+        }
+    }
 
     // SAFETY: đóng handle bất kể trim thành công hay lỗi giữa chừng,
     // tránh leak handle nếu vòng lặp trên gặp lỗi và return sớm.
